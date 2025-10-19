@@ -138,5 +138,26 @@ def gen_anc_base(anc_pts_x, anc_pts_y, anc_scales, anc_ratios, out_size):
 
     return anc_base
 
+def project_bboxes(bboxes, width_scale_factor, height_scale_factor, mode='a2p'):
+    assert mode in ['a2p', 'p2a']
+    
+    batch_size = bboxes.size(dim=0)
+    proj_bboxes = bboxes.clone().reshape(batch_size, -1, 4)
+    invalid_bbox_mask = (proj_bboxes == -1) # indicating padded bboxes
+    
+    if mode == 'a2p':
+        # activation map to pixel image
+        proj_bboxes[:, :, [0, 2]] *= width_scale_factor
+        proj_bboxes[:, :, [1, 3]] *= height_scale_factor
+    else:
+        # pixel image to activation map
+        proj_bboxes[:, :, [0, 2]] /= width_scale_factor
+        proj_bboxes[:, :, [1, 3]] /= height_scale_factor
+        
+    proj_bboxes.masked_fill_(invalid_bbox_mask, -1) # fill padded bboxes back with -1
+    proj_bboxes.resize_as_(bboxes)
+    
+    return proj_bboxes
+
 
 
