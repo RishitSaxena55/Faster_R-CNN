@@ -103,7 +103,7 @@ def display_grid(x_points, y_points, fig, ax, special_point=None):
         
     return fig, ax
 
-def gen_anc_points(out_size):
+def gen_anc_centers(out_size):
     out_h, out_w = out_size
 
     anc_pts_x = torch.arange(0, out_w) + 0.5
