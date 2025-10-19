@@ -110,3 +110,33 @@ def gen_anc_centers(out_size):
     anc_pts_y = torch.arange(0, out_h) + 0.5
 
     return anc_pts_x, anc_pts_y
+
+def gen_anc_base(anc_pts_x, anc_pts_y, anc_scales, anc_ratios, out_size):
+    n_anc_boxes = len(anc_scales) * len(anc_ratios)
+
+    # shape - [1, Wmap, Hmap, n_anchor_boxes, 4]
+    anc_base = torch.zeros(1, anc_pts_x.size(dim=0), anc_pts_y.size(dim=0), n_anc_boxes, 4)
+
+    for ix, xc in enumerate(anc_pts_x):
+        for jx, yc in enumerate(anc_pts_y):
+            anc_boxes = torch.zeros((n_anc_boxes, 4))
+            c = 0
+            for i, scale in enumerate(anc_scales):
+                for j, ratio in enumerate(anc_ratios):
+                    w = scale * ratio
+                    h = scale
+
+                    xmin = xc - w / 2
+                    xmax = xc + w / 2
+                    ymin = yc - h / 2
+                    ymax = yc + h / 2
+
+                    anc_boxes[c, :] = torch.Tensor([xmin, ymin, xmax, ymax])
+                    c += 1
+            
+            anc_base[:, ix, jx, :] = ops.clip_boxes_to_image(anc_boxes, size=out_size)
+
+    return anc_base
+
+
+
