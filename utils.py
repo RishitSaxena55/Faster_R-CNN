@@ -60,7 +60,7 @@ def parse_annotation(annotation_path, image_dir, img_size):
                 
     return gt_boxes_all, gt_classes_all, img_paths
 
-    def display_img(img_data, fig, axes):
+def display_img(img_data, fig, axes):
     for i, img in enumerate(img_data):
         if type(img) == torch.Tensor:
             img = img.permute(1, 2, 0).numpy()
