@@ -4,74 +4,59 @@ from torchvision import ops
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.nn as nn
+
 from utils import *
 
+# -------------------- Models -----------------------
+
+class FeatureExtractor(nn.Module):
+    def __init__(self):
+        super().__init__()
+        model = torchvision.models.resnet50(pretrained=True)
+        req_layers = list(model.children())[:8]
+        self.backbone = nn.Sequential(*req_layers)
+        for param in self.backbone.named_parameters():
+            param[1].requires_grad = True
+        
+    def forward(self, img_data):
+        return self.backbone(img_data)
+    
 class ProposalModule(nn.Module):
     def __init__(self, in_features, hidden_dim=512, n_anchors=9, p_dropout=0.3):
-        super.__init__()
+        super().__init__()
         self.n_anchors = n_anchors
         self.conv1 = nn.Conv2d(in_features, hidden_dim, kernel_size=3, padding=1)
         self.dropout = nn.Dropout(p_dropout)
         self.conf_head = nn.Conv2d(hidden_dim, n_anchors, kernel_size=1)
         self.reg_head = nn.Conv2d(hidden_dim, n_anchors * 4, kernel_size=1)
-    
+        
     def forward(self, feature_map, pos_anc_ind=None, neg_anc_ind=None, pos_anc_coords=None):
         # determine mode
         if pos_anc_ind is None or neg_anc_ind is None or pos_anc_coords is None:
             mode = 'eval'
         else:
             mode = 'train'
-        
+            
         out = self.conv1(feature_map)
         out = F.relu(self.dropout(out))
-
+        
         reg_offsets_pred = self.reg_head(out) # (B, A*4, hmap, wmap)
         conf_scores_pred = self.conf_head(out) # (B, A, hmap, wmap)
-
-        if mode == 'train':
-            # get conf scores
+        
+        if mode == 'train': 
+            # get conf scores 
             conf_scores_pos = conf_scores_pred.flatten()[pos_anc_ind]
             conf_scores_neg = conf_scores_pred.flatten()[neg_anc_ind]
-
             # get offsets for +ve anchors
             offsets_pos = reg_offsets_pred.contiguous().view(-1, 4)[pos_anc_ind]
             # generate proposals using offsets
             proposals = generate_proposals(pos_anc_coords, offsets_pos)
-
+            
             return conf_scores_pos, conf_scores_neg, offsets_pos, proposals
-
+            
         elif mode == 'eval':
             return conf_scores_pred, reg_offsets_pred
-
-def FeatureExtractor(nn.Module):
-    def __init__(self):
-        super().__init__()
-        model = torchvision.models.resnet50(pretrained=True)
-        req_layers=  list(model.children())[:8]
-        self.backbone = nn.Sequential(*req_layers)
-        for param in self.backbone.named_parameters():
-            param[1].requires_grad = True
-    
-    def forward(self, img_data):
-        return self.backbone(img_data)
-
-def calc_cls_loss(conf_scores_pos, conf_scores_neg, batch_size):
-    target_pos = torch.ones_like(conf_scores_pos)
-    target_neg = torch.zeros_like(conf_scores_neg)
-
-    target = torch.cat((target_pos, target_neg))
-    inputs = torch.cat((conf_scores_pos, conf_scores_neg))
-
-    loss = F.binary_cross_entropy_with_logits(inputs, target, reduction='sum') * 1. / batch_size
-
-    return loss
-
-def calc_bbox_reg_loss(gt_offsets, reg_offsets_pos, batch_size):
-    assert gt_offsets.size() == reg_offsets_pos.size()
-    loss = F.smooth_l1_loss(reg_offsets_pos, gt_offsets, reduction='sum') * 1. / batch_size
-
-    return loss
-
+        
 class RegionProposalNetwork(nn.Module):
     def __init__(self, img_size, out_size, out_channels):
         super().__init__()
@@ -163,47 +148,48 @@ class RegionProposalNetwork(nn.Module):
                 conf_scores_final.append(conf_scores_pos)
             
         return proposals_final, conf_scores_final, feature_map
-
+    
 class ClassificationModule(nn.Module):
     def __init__(self, out_channels, n_classes, roi_size, hidden_dim=512, p_dropout=0.3):
-        super().__init__()
+        super().__init__()        
         self.roi_size = roi_size
         # hidden network
         self.avg_pool = nn.AvgPool2d(self.roi_size)
         self.fc = nn.Linear(out_channels, hidden_dim)
         self.dropout = nn.Dropout(p_dropout)
-
+        
         # define classification head
         self.cls_head = nn.Linear(hidden_dim, n_classes)
-    
-    def forward(self, feature_map, proposal_list, gt_classes=None):
+        
+    def forward(self, feature_map, proposals_list, gt_classes=None):
+        
         if gt_classes is None:
             mode = 'eval'
         else:
             mode = 'train'
         
         # apply roi pooling on proposals followed by avg pooling
-        roi_out = ops.roi_pool(feature_map, proposal_list, self.roi_size)
+        roi_out = ops.roi_pool(feature_map, proposals_list, self.roi_size)
         roi_out = self.avg_pool(roi_out)
-
+        
         # flatten the output
         roi_out = roi_out.squeeze(-1).squeeze(-1)
-
+        
         # pass the output through the hidden network
         out = self.fc(roi_out)
         out = F.relu(self.dropout(out))
-
+        
         # get the classification scores
-        cls_scores =  self.cls_head(out)
-
+        cls_scores = self.cls_head(out)
+        
         if mode == 'eval':
             return cls_scores
         
-        # compute CE loss
-        cls_loss = F.cross_entropy(cls_loss, gt_classes.long())
-
+        # compute cross entropy loss
+        cls_loss = F.cross_entropy(cls_scores, gt_classes.long())
+        
         return cls_loss
-
+    
 class TwoStageDetector(nn.Module):
     def __init__(self, img_size, out_size, out_channels, n_classes, roi_size):
         super().__init__() 
@@ -246,3 +232,21 @@ class TwoStageDetector(nn.Module):
             c += n_proposals
             
         return proposals_final, conf_scores_final, classes_final
+
+# ------------------- Loss Utils ----------------------
+
+def calc_cls_loss(conf_scores_pos, conf_scores_neg, batch_size):
+    target_pos = torch.ones_like(conf_scores_pos)
+    target_neg = torch.zeros_like(conf_scores_neg)
+    
+    target = torch.cat((target_pos, target_neg))
+    inputs = torch.cat((conf_scores_pos, conf_scores_neg))
+     
+    loss = F.binary_cross_entropy_with_logits(inputs, target, reduction='sum') * 1. / batch_size
+    
+    return loss
+
+def calc_bbox_reg_loss(gt_offsets, reg_offsets_pos, batch_size):
+    assert gt_offsets.size() == reg_offsets_pos.size()
+    loss = F.smooth_l1_loss(reg_offsets_pos, gt_offsets, reduction='sum') * 1. / batch_size
+    return loss

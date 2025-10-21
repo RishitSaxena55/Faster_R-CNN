@@ -6,7 +6,6 @@ import matplotlib.patches as patches
 from tqdm import tqdm
 
 import torch
-import torchvision
 from torchvision import ops
 import torch.nn.functional as F
 import torch.optim as optim
@@ -61,83 +60,29 @@ def parse_annotation(annotation_path, image_dir, img_size):
                 
     return gt_boxes_all, gt_classes_all, img_paths
 
-def display_img(img_data, fig, axes):
-    for i, img in enumerate(img_data):
-        if type(img) == torch.Tensor:
-            img = img.permute(1, 2, 0).numpy()
-        axes[i].imshow(img)
-    
-    return fig, axes
+# -------------- Prepocessing utils ----------------
 
-def display_bbox(bboxes, fig, ax, classes=None, in_format='xyxy', color='y', line_width=3):
-    if type(bboxes) == np.ndarray:
-        bboxes = torch.from_numpy(bboxes)
-    if classes:
-        assert len(bboxes) == len(classes)
-    # convert boxes to xywh format
-    bboxes = ops.box_convert(bboxes, in_fmt=in_format, out_fmt='xywh')
-    c = 0
-    for box in bboxes:
-        x, y, w, h = box.numpy()
-        # display bounding box
-        rect = patches.Rectangle((x, y), w, h, linewidth=line_width, edgecolor=color, facecolor='none')
-        ax.add_patch(rect)
-        # display category
-        if classes:
-            if classes[c] == 'pad':
-                continue
-            ax.text(x + 5, y + 20, classes[c], bbox=dict(facecolor='yellow', alpha=0.5))
-        c += 1
-        
-    return fig, ax
+def calc_gt_offsets(pos_anc_coords, gt_bbox_mapping):
+    pos_anc_coords = ops.box_convert(pos_anc_coords, in_fmt='xyxy', out_fmt='cxcywh')
+    gt_bbox_mapping = ops.box_convert(gt_bbox_mapping, in_fmt='xyxy', out_fmt='cxcywh')
 
-def display_grid(x_points, y_points, fig, ax, special_point=None):
-    # plot grid
-    for x in x_points:
-        for y in y_points:
-            ax.scatter(x, y, color="w", marker='+')
-            
-    # plot a special point we want to emphasize on the grid
-    if special_point:
-        x, y = special_point
-        ax.scatter(x, y, color="red", marker='+')
-        
-    return fig, ax
+    gt_cx, gt_cy, gt_w, gt_h = gt_bbox_mapping[:, 0], gt_bbox_mapping[:, 1], gt_bbox_mapping[:, 2], gt_bbox_mapping[:, 3]
+    anc_cx, anc_cy, anc_w, anc_h = pos_anc_coords[:, 0], pos_anc_coords[:, 1], pos_anc_coords[:, 2], pos_anc_coords[:, 3]
+
+    tx_ = (gt_cx - anc_cx)/anc_w
+    ty_ = (gt_cy - anc_cy)/anc_h
+    tw_ = torch.log(gt_w / anc_w)
+    th_ = torch.log(gt_h / anc_h)
+
+    return torch.stack([tx_, ty_, tw_, th_], dim=-1)
 
 def gen_anc_centers(out_size):
     out_h, out_w = out_size
-
+    
     anc_pts_x = torch.arange(0, out_w) + 0.5
     anc_pts_y = torch.arange(0, out_h) + 0.5
-
+    
     return anc_pts_x, anc_pts_y
-
-def gen_anc_base(anc_pts_x, anc_pts_y, anc_scales, anc_ratios, out_size):
-    n_anc_boxes = len(anc_scales) * len(anc_ratios)
-
-    # shape - [1, Wmap, Hmap, n_anchor_boxes, 4]
-    anc_base = torch.zeros(1, anc_pts_x.size(dim=0), anc_pts_y.size(dim=0), n_anc_boxes, 4)
-
-    for ix, xc in enumerate(anc_pts_x):
-        for jx, yc in enumerate(anc_pts_y):
-            anc_boxes = torch.zeros((n_anc_boxes, 4))
-            c = 0
-            for i, scale in enumerate(anc_scales):
-                for j, ratio in enumerate(anc_ratios):
-                    w = scale * ratio
-                    h = scale
-
-                    xmin = xc - w / 2
-                    xmax = xc + w / 2
-                    ymin = yc - h / 2
-                    ymax = yc + h / 2
-
-                    anc_boxes[c, :] = torch.Tensor([xmin, ymin, xmax, ymax])
-                    c += 1
-            
-            anc_base[:, ix, jx, :] = ops.clip_boxes_to_image(anc_boxes, size=out_size)
-
-    return anc_base
 
 def project_bboxes(bboxes, width_scale_factor, height_scale_factor, mode='a2p'):
     assert mode in ['a2p', 'p2a']
@@ -160,7 +105,51 @@ def project_bboxes(bboxes, width_scale_factor, height_scale_factor, mode='a2p'):
     
     return proj_bboxes
 
+def generate_proposals(anchors, offsets):
+   
+    # change format of the anchor boxes from 'xyxy' to 'cxcywh'
+    anchors = ops.box_convert(anchors, in_fmt='xyxy', out_fmt='cxcywh')
+
+    # apply offsets to anchors to create proposals
+    proposals_ = torch.zeros_like(anchors)
+    proposals_[:,0] = anchors[:,0] + offsets[:,0]*anchors[:,2]
+    proposals_[:,1] = anchors[:,1] + offsets[:,1]*anchors[:,3]
+    proposals_[:,2] = anchors[:,2] * torch.exp(offsets[:,2])
+    proposals_[:,3] = anchors[:,3] * torch.exp(offsets[:,3])
+
+    # change format of proposals back from 'cxcywh' to 'xyxy'
+    proposals = ops.box_convert(proposals_, in_fmt='cxcywh', out_fmt='xyxy')
+
+    return proposals
+
+def gen_anc_base(anc_pts_x, anc_pts_y, anc_scales, anc_ratios, out_size):
+    n_anc_boxes = len(anc_scales) * len(anc_ratios)
+    anc_base = torch.zeros(1, anc_pts_x.size(dim=0) \
+                              , anc_pts_y.size(dim=0), n_anc_boxes, 4) # shape - [1, Hmap, Wmap, n_anchor_boxes, 4]
+    
+    for ix, xc in enumerate(anc_pts_x):
+        for jx, yc in enumerate(anc_pts_y):
+            anc_boxes = torch.zeros((n_anc_boxes, 4))
+            c = 0
+            for i, scale in enumerate(anc_scales):
+                for j, ratio in enumerate(anc_ratios):
+                    w = scale * ratio
+                    h = scale
+                    
+                    xmin = xc - w / 2
+                    ymin = yc - h / 2
+                    xmax = xc + w / 2
+                    ymax = yc + h / 2
+
+                    anc_boxes[c, :] = torch.Tensor([xmin, ymin, xmax, ymax])
+                    c += 1
+
+            anc_base[:, ix, jx, :] = ops.clip_boxes_to_image(anc_boxes, size=out_size)
+            
+    return anc_base
+
 def get_iou_mat(batch_size, anc_boxes_all, gt_bboxes_all):
+    
     # flatten anchor boxes
     anc_boxes_flat = anc_boxes_all.reshape(batch_size, -1, 4)
     # get total anchor boxes for a single image
@@ -168,28 +157,14 @@ def get_iou_mat(batch_size, anc_boxes_all, gt_bboxes_all):
     
     # create a placeholder to compute IoUs amongst the boxes
     ious_mat = torch.zeros((batch_size, tot_anc_boxes, gt_bboxes_all.size(dim=1)))
-    
+
     # compute IoU of the anc boxes with the gt boxes for all the images
     for i in range(batch_size):
         gt_bboxes = gt_bboxes_all[i]
         anc_boxes = anc_boxes_flat[i]
         ious_mat[i, :] = ops.box_iou(anc_boxes, gt_bboxes)
-    
+        
     return ious_mat
-
-def calc_gt_offsets(pos_anc_coords, gt_bbox_mapping):
-    pos_anc_coords = ops.box_convert( pos_anc_coords, in_fmt='xyxy', out_fmt='cxcywh')
-    gt_bbox_mapping = ops.box_convert(gt_bbox_mapping, in_fmt='xyxy', out_fmt='cxcywh')
-
-    gt_cx, gt_cy, gt_w, gt_h = gt_bbox_mapping[:, 0], gt_bbox_mapping[:, 1], gt_bbox_mapping[:, 2], gt_bbox_mapping[:, 3]
-    anc_cx, anc_cy, anc_w, anc_h = pos_anc_coords[:, 0], pos_anc_coords[:, 1], pos_anc_coords[:, 2], pos_anc_coords[:, 3]
-
-    tx_ = (gt_cx -  anc_cx) / anc_w
-    ty_ = (gt_cy - anc_cy) / anc_h
-    tw_ = torch.log(gt_w / anc_w)
-    th_ = torch.log(gt_h / anc_h)
-
-    return torch.stack([tx_, ty_, tw_, th_], dim=-1)
 
 def get_req_anchors(anc_boxes_all, gt_bboxes_all, gt_classes_all, pos_thresh=0.7, neg_thresh=0.2):
     '''
@@ -293,43 +268,47 @@ def get_req_anchors(anc_boxes_all, gt_bboxes_all, gt_classes_all, pos_thresh=0.7
     return positive_anc_ind, negative_anc_ind, GT_conf_scores, GT_offsets, GT_class_pos, \
          positive_anc_coords, negative_anc_coords, positive_anc_ind_sep
 
-def generate_proposals(anchors, offsets):
-    # change format of the anchor boxes from 'xyxy' to 'cxcywh'
-    anchors = ops.box_convert(anchors, in_fmt='xyxy', out_fmt='cxcywh')
+# # -------------- Visualization utils ----------------
 
-    # apply offsets to anchors to create proposals
-    proposals_ = torch.zeros_like(anchors)
-    proposals_[:, 0] = anchors[:, 0] + offsets[:, 0] * anchors[:, 2]
-    proposals_[:, 1] = anchors[:, 1] + offsets[:, 1] * anchors[:, 3]
-    proposals_[:, 2] = anchors[:, 2] * torch.exp(offsets[:, 2])
-    proposals_[:, 3] = anchors[:, 3] * torch.exp(offsets[:, 3])
-
-    # change format of proposals back from 'cxcywh' to 'xyxy'
-    proposals_ = ops.box_convert(proposals_, in_fmt='cxcywh', out_fmt='xyxy')
-
-    return proposals_
-
-
+def display_img(img_data, fig, axes):
+    for i, img in enumerate(img_data):
+        if type(img) == torch.Tensor:
+            img = img.permute(1, 2, 0).numpy()
+        axes[i].imshow(img)
     
+    return fig, axes
 
+def display_bbox(bboxes, fig, ax, classes=None, in_format='xyxy', color='y', line_width=3):
+    if type(bboxes) == np.ndarray:
+        bboxes = torch.from_numpy(bboxes)
+    if classes:
+        assert len(bboxes) == len(classes)
+    # convert boxes to xywh format
+    bboxes = ops.box_convert(bboxes, in_fmt=in_format, out_fmt='xywh')
+    c = 0
+    for box in bboxes:
+        x, y, w, h = box.numpy()
+        # display bounding box
+        rect = patches.Rectangle((x, y), w, h, linewidth=line_width, edgecolor=color, facecolor='none')
+        ax.add_patch(rect)
+        # display category
+        if classes:
+            if classes[c] == 'pad':
+                continue
+            ax.text(x + 5, y + 20, classes[c], bbox=dict(facecolor='yellow', alpha=0.5))
+        c += 1
+        
+    return fig, ax
 
-
-    
-
-
-
-
-
-
-
-
-
-
-
-    
-
-
-
-
-
-
+def display_grid(x_points, y_points, fig, ax, special_point=None):
+    # plot grid
+    for x in x_points:
+        for y in y_points:
+            ax.scatter(x, y, color="w", marker='+')
+            
+    # plot a special point we want to emphasize on the grid
+    if special_point:
+        x, y = special_point
+        ax.scatter(x, y, color="red", marker='+')
+        
+    return fig, ax
