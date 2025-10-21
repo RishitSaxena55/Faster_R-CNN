@@ -279,31 +279,26 @@ def display_img(img_data, fig, axes):
     return fig, axes
 
 def display_bbox(bboxes, fig, ax, classes=None, in_format='xyxy', color='y', line_width=3):
-    if isinstance(bboxes, np.ndarray):
+    if type(bboxes) == np.ndarray:
         bboxes = torch.from_numpy(bboxes)
-
-    # ensure float tensor
-    bboxes = bboxes.float()
-
-    # filter out invalid boxes before converting
-    valid_mask = torch.isfinite(bboxes).all(dim=1) & (bboxes >= 0).all(dim=1)
-    bboxes = bboxes[valid_mask]
     if classes:
-        classes = [cls for i, cls in enumerate(classes) if valid_mask[i]]
-
-    # convert to xywh format
+        assert len(bboxes) == len(classes)
+    # convert boxes to xywh format
     bboxes = ops.box_convert(bboxes, in_fmt=in_format, out_fmt='xywh')
-
-    for i, box in enumerate(bboxes):
-        x, y, w, h = box.tolist()
-        if not np.isfinite([x, y, w, h]).all() or w <= 0 or h <= 0:
-            continue  # skip invalid bounding boxes
+    c = 0
+    for box in bboxes:
+        x, y, w, h = box.numpy()
+        # display bounding box
         rect = patches.Rectangle((x, y), w, h, linewidth=line_width, edgecolor=color, facecolor='none')
         ax.add_patch(rect)
-        if classes and classes[i] != 'pad':
-            ax.text(x + 5, y + 20, classes[i], bbox=dict(facecolor='yellow', alpha=0.5))
+        # display category
+        if classes:
+            if classes[c] == 'pad':
+                continue
+            ax.text(x + 5, y + 20, classes[c], bbox=dict(facecolor='yellow', alpha=0.5))
+        c += 1
+        
     return fig, ax
-
 
 def display_grid(x_points, y_points, fig, ax, special_point=None):
     # plot grid
